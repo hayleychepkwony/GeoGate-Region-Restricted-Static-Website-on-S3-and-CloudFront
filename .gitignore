@@ -1,0 +1,7 @@
+*.pem
+*.key
+.env
+*.secret
+results.md
+__pycache__/
+.DS_Store

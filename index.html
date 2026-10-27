@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GeoGate | AWS Capstone 3</title>
+  <meta name="description" content="A static website on a private Amazon S3 bucket, delivered by Amazon CloudFront with country-level access control.">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="hero">
+  <nav class="top" aria-label="Main">
+    <span class="brand"><span class="dot" aria-hidden="true"></span>GeoGate</span>
+    <span class="links">
+      <a href="#journey">Request journey</a>
+      <a href="#stack">The stack</a>
+      <a href="#notes">Build notes</a>
+    </span>
+  </nav>
+  <div class="hero-inner">
+    <p class="eyebrow">AWS re/Start &middot; geogate-s3-cloudfront</p>
+    <h1>Fast for most of the world.<br><span>Closed where it needs to be.</span></h1>
+    <p class="lede">
+      This site lives in a private Amazon S3 bucket and reaches visitors through Amazon CloudFront.
+      Every request is checked at the edge, so visitors from blocked countries are turned away
+      before they ever touch the bucket.
+    </p>
+    <ul class="chips" aria-label="Services used">
+      <li>Amazon S3</li>
+      <li>Amazon CloudFront</li>
+      <li>Origin Access Control</li>
+      <li>Geographic restriction</li>
+    </ul>
+  </div>
+</header>
+
+<main>
+
+  <section id="journey">
+    <h2>Follow a request</h2>
+    <p class="sub">Choose a visitor and see what happens to their request.</p>
+
+    <div class="toggle" role="group" aria-label="Choose a visitor">
+      <button type="button" data-case="allowed" aria-pressed="true">Visitor in an allowed country</button>
+      <button type="button" data-case="blocked" aria-pressed="false">Visitor in a blocked country</button>
+    </div>
+
+    <div class="path" data-path="allowed">
+      <ol class="steps">
+        <li><h3>The browser asks for the page</h3><p>The request goes over HTTPS to the nearest CloudFront edge location.</p></li>
+        <li><h3>Country check</h3><p>CloudFront works out the visitor's country from their IP address. It is not on the block list, so the request continues.</p></li>
+        <li><h3>Cache lookup</h3><p>If the edge already holds a fresh copy it answers straight away. If not, it fetches the file from S3.</p></li>
+        <li><h3>Private bucket</h3><p>S3 only answers requests signed by this exact CloudFront distribution. The bucket is never public.</p></li>
+      </ol>
+      <p class="result ok"><strong>200 OK</strong> The page is delivered.</p>
+    </div>
+
+    <div class="path" data-path="blocked" hidden>
+      <ol class="steps">
+        <li><h3>The browser asks for the page</h3><p>The request goes over HTTPS to the nearest CloudFront edge location.</p></li>
+        <li><h3>Country check</h3><p>The visitor's country is on the block list.</p></li>
+        <li><h3>Stopped at the edge</h3><p>CloudFront refuses the request. S3 is never contacted, so nothing is read from the bucket.</p></li>
+      </ol>
+      <p class="result no"><strong>403 Forbidden</strong> &ldquo;The Amazon CloudFront distribution is configured to block access from your country.&rdquo;</p>
+    </div>
+  </section>
+
+  <section id="stack">
+    <h2>The stack</h2>
+    <p class="sub">Four pieces, each with one clear job.</p>
+    <div class="cards">
+      <article class="card">
+        <h3>Amazon S3</h3>
+        <p>Stores <code>index.html</code>, <code>error.html</code> and <code>style.css</code>. Block Public Access is on, so the only way in is through CloudFront.</p>
+      </article>
+      <article class="card">
+        <h3>Amazon CloudFront</h3>
+        <p>Caches the site at edge locations worldwide, redirects HTTP to HTTPS, and serves every visitor from a nearby location.</p>
+      </article>
+      <article class="card">
+        <h3>Origin Access Control</h3>
+        <p>CloudFront signs each request to S3. A bucket policy then allows reads only when the request comes from this distribution.</p>
+      </article>
+      <article class="card">
+        <h3>Geographic restriction</h3>
+        <p>A country block list built into CloudFront. It runs before the cache and the origin, and it needs no extra firewall service.</p>
+      </article>
+    </div>
+  </section>
+
+  <section id="notes">
+    <h2>Build notes</h2>
+    <p class="sub">Things worth remembering from setting this up.</p>
+    <details>
+      <summary>Why not use S3 static website hosting directly?</summary>
+      <p>That mode needs a public bucket, serves plain HTTP only, and cannot filter by country. A private bucket with Origin Access Control fixes all three.</p>
+    </details>
+    <details>
+      <summary>Why did the plain address say &ldquo;Access Denied&rdquo; at first?</summary>
+      <p>CloudFront had no default root object. Asking for <code>/</code> made S3 look for a file with an empty name. Setting the default root object to <code>index.html</code> fixed it.</p>
+    </details>
+    <details>
+      <summary>How accurate is the country check?</summary>
+      <p>CloudFront infers the country from the visitor's IP address using a third-party database. It is very good but not perfect, and a VPN changes the answer, which is exactly how the block was tested.</p>
+    </details>
+  </section>
+
+</main>
+
+<footer>
+  <p>Hayley Chepkemoi &middot; AWS re/Start Capstone Project 3 &middot; Hosted on Amazon S3 and Amazon CloudFront</p>
+</footer>
+
+<script>
+  (function () {
+    var buttons = document.querySelectorAll('[data-case]');
+    var paths = document.querySelectorAll('.path');
+    buttons.forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        var chosen = btn.getAttribute('data-case');
+        buttons.forEach(function (b) { b.setAttribute('aria-pressed', b === btn ? 'true' : 'false'); });
+        paths.forEach(function (p) { p.hidden = p.getAttribute('data-path') !== chosen; });
+      });
+    });
+  })();
+</script>
+</body>
+</html>

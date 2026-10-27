@@ -1,0 +1,248 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Project 2 - Two-tier app. Public web server, private MariaDB server on EC2.
+  A NAT gateway lets the database pull updates from the internet (outbound only).
+  A bastion host lets one administrator reach the database remotely over an SSH tunnel.
+
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Existing EC2 key pair used for the bastion and DB server.
+  AdminCidr:
+    Type: String
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/32$'
+    Description: The administrator's public IP in /32 form, e.g. 203.0.113.25/32 (see https://checkip.amazonaws.com).
+  DBAppPassword:
+    Type: String
+    NoEcho: true
+    AllowedPattern: '[A-Za-z0-9]{12,32}'
+    Description: Password for the application's limited DB user (letters and digits only, 12-32 chars).
+  DBAdminPassword:
+    Type: String
+    NoEcho: true
+    AllowedPattern: '[A-Za-z0-9]{12,32}'
+    Description: Password for the administrator DB user (letters and digits only, 12-32 chars).
+  InstanceType:
+    Type: String
+    Default: t3.micro
+
+Resources:
+  # ---------------- Network ----------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: capstone2-vpc}]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{Key: Name, Value: capstone2-igw}]
+
+  IgwAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: capstone2-public}]
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{Key: Name, Value: capstone2-private}]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags: [{Key: Name, Value: capstone2-public-rt}]
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: IgwAttachment
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet
+      Tags: [{Key: Name, Value: capstone2-nat}]
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags: [{Key: Name, Value: capstone2-private-rt}]
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ---------------- Security groups ----------------
+  WebSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Web tier - HTTP from anywhere
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0}
+      Tags: [{Key: Name, Value: capstone2-web-sg}]
+
+  BastionSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Bastion - SSH from the administrator IP only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: !Ref AdminCidr}
+      Tags: [{Key: Name, Value: capstone2-bastion-sg}]
+
+  DbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: DB tier - MySQL from web tier and bastion, SSH from bastion. No internet inbound.
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 3306, ToPort: 3306, SourceSecurityGroupId: !Ref WebSG}
+        - {IpProtocol: tcp, FromPort: 3306, ToPort: 3306, SourceSecurityGroupId: !Ref BastionSG}
+        - {IpProtocol: tcp, FromPort: 22, ToPort: 22, SourceSecurityGroupId: !Ref BastionSG}
+      Tags: [{Key: Name, Value: capstone2-db-sg}]
+
+  # ---------------- Servers ----------------
+  DbServer:
+    Type: AWS::EC2::Instance
+    DependsOn: PrivateDefaultRoute # needs the NAT route to download packages at boot
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PrivateSubnet
+      SecurityGroupIds: [!Ref DbSG]
+      Tags: [{Key: Name, Value: capstone2-db}]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # Runs in the private subnet: all internet access goes out through the NAT gateway.
+          dnf update -y
+          dnf install -y mariadb105-server
+          printf '[mysqld]\nbind-address=0.0.0.0\n' > /etc/my.cnf.d/99-bind.cnf
+          systemctl enable --now mariadb
+          mysql <<'SQL'
+          CREATE DATABASE IF NOT EXISTS shopdb;
+          CREATE USER 'webapp'@'10.0.1.%' IDENTIFIED BY '${DBAppPassword}';
+          GRANT SELECT, INSERT, UPDATE, DELETE ON shopdb.* TO 'webapp'@'10.0.1.%';
+          CREATE USER 'dbadmin'@'10.0.1.%' IDENTIFIED BY '${DBAdminPassword}';
+          GRANT ALL PRIVILEGES ON *.* TO 'dbadmin'@'10.0.1.%' WITH GRANT OPTION;
+          USE shopdb;
+          CREATE TABLE IF NOT EXISTS products (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            name VARCHAR(80) NOT NULL,
+            price DECIMAL(8,2) NOT NULL
+          );
+          INSERT INTO products (name, price) VALUES
+            ('Kitenge Tote', 18.00), ('Handwoven Basket', 25.00), ('Silk Scarf', 32.00);
+          FLUSH PRIVILEGES;
+          SQL
+
+  WebServer:
+    Type: AWS::EC2::Instance
+    DependsOn: PublicDefaultRoute
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds: [!Ref WebSG]
+      Tags: [{Key: Name, Value: capstone2-web}]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          dnf update -y
+          dnf install -y httpd php php-mysqlnd
+          cat > /var/www/html/index.php <<'PHP'
+          <?php
+          mysqli_report(MYSQLI_REPORT_OFF);
+          $db = @new mysqli('${DbServer.PrivateIp}', 'webapp', '${DBAppPassword}', 'shopdb');
+          ?>
+          <!doctype html>
+          <html lang="en"><head><meta charset="utf-8"><title>Two-Tier Shop</title>
+          <style>body{font-family:system-ui,sans-serif;max-width:640px;margin:3rem auto;padding:0 1rem}
+          table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #ddd;padding:.5rem;text-align:left}
+          .ok{color:#0a7d33}.bad{color:#b3261e}</style></head><body>
+          <h1>Two-Tier Shop</h1>
+          <?php if ($db->connect_errno): ?>
+            <p class="bad">Web tier is up, but the database is not reachable yet (it may still be installing - retry in a minute).</p>
+          <?php else: ?>
+            <p class="ok">Web tier (public subnet) is talking to the database tier (private subnet).</p>
+            <table><tr><th>#</th><th>Product</th><th>Price (USD)</th></tr>
+            <?php foreach ($db->query('SELECT id, name, price FROM products') as $row): ?>
+              <tr><td><?= (int)$row['id'] ?></td><td><?= htmlspecialchars($row['name']) ?></td><td><?= number_format($row['price'], 2) ?></td></tr>
+            <?php endforeach; ?>
+            </table>
+          <?php endif; ?>
+          </body></html>
+          PHP
+          rm -f /var/www/html/index.html
+          systemctl enable --now httpd php-fpm
+
+  Bastion:
+    Type: AWS::EC2::Instance
+    DependsOn: PublicDefaultRoute
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds: [!Ref BastionSG]
+      Tags: [{Key: Name, Value: capstone2-bastion}]
+
+Outputs:
+  WebsiteUrl:
+    Value: !Sub http://${WebServer.PublicIp}
+  NatGatewayPublicIp:
+    Description: The DB server's outbound traffic appears to come from this IP.
+    Value: !Ref NatEip
+  BastionPublicIp:
+    Value: !GetAtt Bastion.PublicIp
+  DbPrivateIp:
+    Value: !GetAtt DbServer.PrivateIp
+  SshTunnelCommand:
+    Description: Run on the administrator's computer, then connect a SQL client to 127.0.0.1:3307.
+    Value: !Sub ssh -i <your-key>.pem -L 3307:${DbServer.PrivateIp}:3306 ec2-user@${Bastion.PublicIp}
