@@ -1,77 +1,108 @@
-# WordPress site for an e-commerce start-up
+# GeoGate: Region-Restricted Static Website on S3 and CloudFront
+
+**AWS re/Start Capstone Project 3 - status: built and tested.**
+
+> A private Amazon S3 website delivered worldwide through CloudFront, with Russia blocked by a country-level geo-restriction and the block tested over VPN.
 
 ## Scenario
 
-An e-commerce start-up wants a website with a **simple interface** and **as little development cost as possible**, plus a
-**DNS name**. The solution: host **WordPress on AWS**.
+Host a **static website on Amazon S3** that is **globally accessible**, but **blocks users in Russia**. Use
+**Amazon CloudFront** for performance.
 
 ## Solution
 
 ```mermaid
 flowchart LR
-    V[Visitor] -- shop.example.com --> R53[Route 53<br/>A record]
-    R53 --> EIP[Elastic IP]
-    EIP --> EC2
-    subgraph EC2 instance - Amazon Linux 2023
-      A[Apache + PHP] --> M[(MariaDB)]
-    end
+    V[Visitor] -- HTTPS --> E[CloudFront edge<br/>geo block list]
+    E -- cache hit --> V
+    E -- "cache miss<br/>signed request (OAC)" --> S[(Private S3 bucket)]
+    V2[Visitor in a blocked country] -. HTTP 403 .-> E
 ```
 
-WordPress gives the client a ready-made admin dashboard, themes and e-commerce plugins (such as WooCommerce), so there
-is no custom development. Everything runs on **one EC2 instance** to keep the cost low:
+- The **S3 bucket is private** (Block Public Access on). Only this CloudFront distribution can read it, through
+  **Origin Access Control (OAC)** and a bucket policy that checks the distribution's ARN.
+- **CloudFront** caches content at edge locations worldwide, which is the performance win, and applies a
+  **geo-restriction block list** containing Russia.
+- Price class is **all edge locations**, because cheaper classes leave out Africa, Asia and South America.
 
-- **Elastic IP** keeps the address fixed across stop/start, so DNS never breaks.
-- **Route 53** record (or any DNS provider) maps the domain to that IP.
-- The **security group** opens 80/443 to the world and 22 only to the administrator's IP.
-- The database password is **generated on the server** during setup and is not stored in this repo.
+Why not S3 static-website hosting directly? It needs a public bucket and HTTP only, and it cannot do geo blocking.
+OAC keeps the bucket private and gives HTTPS.
 
-| Option | Cost | Trade-off |
-|--------|------|-----------|
-| **Single EC2 (this project)** | Lowest | One server holds site and database. Back it up. |
-| Amazon Lightsail WordPress blueprint | Low, fixed | Even simpler, less AWS-service learning. |
-| EC2 + RDS + ALB + Auto Scaling | Higher | Highly available, for when traffic grows. |
+The website itself is in [`website/`](website/): a single-page explainer with an interactive "follow a request"
+section, plus a custom error page.
+
+## Results
+
+| # | Test | Expected | Result |
+|---|------|----------|--------|
+| 1 | Open the CloudFront URL with no VPN (Kenya) | Page loads | Page loaded |
+| 2 | Open the same URL through a VPN exit in the Netherlands, with the Netherlands on the block list | HTTP 403 | CloudFront returned 403: "configured to block access from your country" |
+
+**No VPN (Kenya) - allowed**
+
+![Site loading with no VPN](screenshots/no-vpn.png)
+
+**VPN in the Netherlands - blocked**
+
+![403 error through a Netherlands VPN](screenshots/vpn-blocked-netherlands.png)
+
+**How the block was tested.** The free VPN tier I used (Proton VPN) has no Russian server, so I added the Netherlands
+to the block list as a stand-in. The geo-restriction works the same way for every country code, so a block on the
+Netherlands proves the mechanism. After the test I removed the Netherlands, leaving **Russia** as the only blocked country.
+
+CloudFront decides the country from the visitor's IP address using a third-party database, so results depend on where
+the VPN exit is, and a small number of IPs can be mapped to the wrong country.
+
+## Issues I ran into
+
+| Problem | Cause | Fix |
+|---------|-------|-----|
+| Creating the distribution failed with `not authorized to perform: wafv2:CreateWebACL` | The new CloudFront wizard had *Security protections* (AWS WAF) switched on, and the lab account is not allowed to create web ACLs | Went back and created the distribution with security protections off. Geographic restriction is a CloudFront feature and does not need WAF. |
+| The CloudFront address showed an XML `AccessDenied` error | No **Default root object** was set. Requesting `/` makes S3 look for an object with an empty name. `/index.html` and `/style.css` worked, which showed the bucket policy was fine | Set **Default root object** to `index.html` under *General > Settings*. |
+| Blocked visitors see CloudFront's plain 403 page | No custom error response configured in the console build | Optional: add a 403 error page under *Error pages* pointing to `/error.html` (the CloudFormation template already does this). |
 
 ## Build it - console walkthrough
 
-1. **Launch EC2.** Amazon Linux 2023, `t3.small` (a `t3.micro` also works), public subnet, your key pair. Security group:
-   HTTP 80, HTTPS 443 from anywhere, SSH 22 from **My IP**. In *Advanced details > User data* paste
-   [`userdata/wordpress-userdata.sh`](userdata/wordpress-userdata.sh).
-2. **Allocate an Elastic IP** and associate it with the instance.
-3. **Create the DNS name.** Route 53 > hosted zone for your domain > **A record** `shop.yourdomain.com` > the Elastic IP.
-   If you do not own a domain, register one in Route 53, or use a registrar and point its name servers at the hosted zone.
-4. **Finish setup in the browser.** After 3-5 minutes open `http://shop.yourdomain.com` and complete the WordPress
-   installer (site title, admin user, password). Use the domain, not the IP, so WordPress records the right site URL.
-5. **Install a theme and plugin** (for example a shop theme and WooCommerce), then add a sample product.
-6. **HTTPS (recommended).** SSH in and run Certbot, or put CloudFront with an ACM certificate in front of the site.
+1. **Create a bucket** with a globally unique name. Keep **Block all public access** ON.
+2. **Upload** the contents of [`website/`](website/) (`index.html`, `error.html`, `style.css`) to the top level of the bucket.
+3. **Create a CloudFront distribution.**
+   - Origin: the S3 bucket (choose the bucket, not the website endpoint).
+   - Origin access: **Origin access control settings** > create a new OAC with the defaults.
+   - Viewer protocol policy: redirect HTTP to HTTPS.
+   - Security protections / WAF: **off** (not needed, and some lab accounts cannot create it).
+   - Price class: use all edge locations, if the option is shown.
+4. **Update the bucket policy.** Copy the policy CloudFront generates (distribution > *Origins* > edit the origin > *Copy policy*)
+   into the bucket's *Permissions > Bucket policy*.
+5. **Set the default root object** to `index.html` (distribution > *General > Settings > Edit*).
+6. **Block Russia.** Distribution > *Security > Geographic restrictions* > **Block list** > add *Russian Federation*.
+7. (Optional) *Error pages*: map 403 and 404 to `/error.html`.
 
 ## Build it - CloudFormation
 
 ```bash
-aws cloudformation deploy \
-  --template-file cloudformation/wordpress.yaml \
-  --stack-name capstone4-wordpress \
-  --parameter-overrides VpcId=vpc-xxxx SubnetId=subnet-xxxx KeyName=my-key \
-                        AdminCidr=$(curl -s https://checkip.amazonaws.com)/32
-  # optional DNS: DomainName=shop.example.com HostedZoneId=Z123
-aws cloudformation describe-stacks --stack-name capstone4-wordpress --query "Stacks[0].Outputs"
+aws cloudformation deploy --template-file cloudformation/static-site.yaml --stack-name capstone3-static-site
+./scripts/deploy.sh          # uploads website/ and clears the CDN cache
+aws cloudformation describe-stacks --stack-name capstone3-static-site --query "Stacks[0].Outputs"
 ```
 
-## Verify it
+## Update the site after editing the files
 
-| Check | Expected | Screenshot |
-|-------|----------|------------|
-| `http://<domain>` shows the WordPress installer or site | Page loads | `screenshots/wp-install.png` |
-| `nslookup <domain>` | Returns the Elastic IP | `screenshots/nslookup.png` |
-| `/wp-admin` login | Dashboard opens | `screenshots/wp-dashboard.png` |
-| Final storefront with a sample product | Site renders | `screenshots/storefront.png` |
+Upload the changed files to the bucket (S3 > bucket > *Upload*, overwrite the existing ones), then clear the CDN cache:
+CloudFront > distribution > *Invalidations* > *Create invalidation* > `/*`.
+
+## Test it from the command line (optional)
+
+```bash
+python3 tools/check_site.py https://dxxxxxxxx.cloudfront.net --show-ip --label "VPN: Netherlands" --log results.md
+```
 
 ## Clean-up
 
-Terminate the instance, **release the Elastic IP** (idle ones are billed), delete the Route 53 record and hosted zone,
-and delete the security group. With CloudFormation: `aws cloudformation delete-stack --stack-name capstone4-wordpress`.
+Disable and delete the distribution, empty the bucket (`aws s3 rm s3://<bucket> --recursive`), then delete the bucket.
+With CloudFormation, empty the bucket first, then `aws cloudformation delete-stack --stack-name capstone3-static-site`.
 
 ## Possible improvements
 
-- Move the database to Amazon RDS and media to S3 + CloudFront.
-- Automate backups with AWS Backup or EBS snapshots on a schedule.
-- Add HTTPS with Let's Encrypt or ACM and harden with a WAF.
+- Custom domain with Route 53 and an ACM certificate (the certificate must be issued in us-east-1).
+- Add security headers with a CloudFront response-headers policy.
+- Deploy automatically with a GitHub Actions workflow that runs `scripts/deploy.sh`.
